@@ -659,3 +659,495 @@ actor FlakyTransport: SyncTransport {
         #expect(!SeriesEnricher.isPhaseAbortingError(NSError(domain: "x", code: 1)))
     }
 }
+
+// MARK: - Observer wake workout enrichment + route observation
+
+@Suite struct ObserverWorkoutEnrichmentTests {
+    @Test func observedSampleTypesIncludesWorkoutRouteWhenRoutesEnabled() {
+        let enabled = SyncConfiguration(
+            enabledTypes: [HealthTypeCatalog.workoutIdentifier],
+            includeWorkoutRoutes: true
+        )
+        let map = HealthSyncEngine.observedSampleTypes(for: enabled)
+        #expect(map[HKWorkoutType.workoutType()] == HealthTypeCatalog.workoutIdentifier)
+        #expect(map[HKSeriesType.workoutRoute()] == HealthTypeCatalog.workoutIdentifier)
+
+        let routesDisabled = SyncConfiguration(
+            enabledTypes: [HealthTypeCatalog.workoutIdentifier],
+            includeWorkoutRoutes: false
+        )
+        let mapNoRoutes = HealthSyncEngine.observedSampleTypes(for: routesDisabled)
+        #expect(mapNoRoutes[HKWorkoutType.workoutType()] == HealthTypeCatalog.workoutIdentifier)
+        #expect(mapNoRoutes[HKSeriesType.workoutRoute()] == nil)
+    }
+
+    @Test func observerRefreshRunsImmediatelyOnWorkoutDelivery() {
+        let workoutState = TypeSyncState(identifier: HealthTypeCatalog.workoutIdentifier)
+        let enrichmentState = WorkoutEnrichmentState()
+        #expect(HealthSyncEngine.shouldRefreshWorkoutEnrichment(
+            updatedRawTypes: [HealthTypeCatalog.workoutIdentifier],
+            workoutState: workoutState,
+            enrichmentState: enrichmentState
+        ))
+    }
+
+    @Test func observerRefreshCatchesUpUnenrichedAndLateArrivalWorkouts() {
+        let now = Date(timeIntervalSince1970: 10_000_000)
+        var workoutState = TypeSyncState(identifier: HealthTypeCatalog.workoutIdentifier)
+        workoutState.backfillComplete = true
+        workoutState.lastSyncAt = now.addingTimeInterval(-600) // 10 min ago
+
+        var enrichmentState = WorkoutEnrichmentState()
+        // Never computed yet after workout backfill completed -> refresh.
+        #expect(HealthSyncEngine.shouldRefreshWorkoutEnrichment(
+            updatedRawTypes: ["HKQuantityTypeIdentifierHeartRate"],
+            workoutState: workoutState,
+            enrichmentState: enrichmentState,
+            now: now
+        ))
+
+        // Workout synced more recently than last enrichment -> refresh.
+        enrichmentState.lastComputedAt = now.addingTimeInterval(-900)
+        #expect(HealthSyncEngine.shouldRefreshWorkoutEnrichment(
+            updatedRawTypes: ["HKQuantityTypeIdentifierHeartRate"],
+            workoutState: workoutState,
+            enrichmentState: enrichmentState,
+            now: now
+        ))
+
+        // Enrichment ran 5 minutes ago (after the workout sync) -> wait for minimumInterval.
+        enrichmentState.lastComputedAt = now.addingTimeInterval(-300)
+        #expect(!HealthSyncEngine.shouldRefreshWorkoutEnrichment(
+            updatedRawTypes: ["HKQuantityTypeIdentifierHeartRate"],
+            workoutState: workoutState,
+            enrichmentState: enrichmentState,
+            now: now
+        ))
+
+        // 45 minutes after workout sync and 35 minutes since last enrichment -> late-arrival self-heal runs.
+        workoutState.lastSyncAt = now.addingTimeInterval(-45 * 60)
+        enrichmentState.lastComputedAt = now.addingTimeInterval(-35 * 60)
+        #expect(HealthSyncEngine.shouldRefreshWorkoutEnrichment(
+            updatedRawTypes: ["HKQuantityTypeIdentifierHeartRate"],
+            workoutState: workoutState,
+            enrichmentState: enrichmentState,
+            now: now
+        ))
+
+        // 12 hours after last workout sync, already enriched after that workout -> no redundant rescan.
+        workoutState.lastSyncAt = now.addingTimeInterval(-12 * 3600)
+        enrichmentState.lastComputedAt = now.addingTimeInterval(-11 * 3600)
+        #expect(!HealthSyncEngine.shouldRefreshWorkoutEnrichment(
+            updatedRawTypes: ["HKQuantityTypeIdentifierHeartRate"],
+            workoutState: workoutState,
+            enrichmentState: enrichmentState,
+            now: now
+        ))
+
+        // A workout route in pendingLateArrival whose retry timer is due wakes enrichment immediately.
+        let pendingUUID = UUID()
+        enrichmentState.routeRecords = [
+            pendingUUID.uuidString.lowercased(): WorkoutRouteSyncRecord(
+                workoutUUID: pendingUUID,
+                activityTypeRaw: HKWorkoutActivityType.walking.rawValue,
+                workoutStart: now.addingTimeInterval(-1800),
+                workoutEnd: now.addingTimeInterval(-300),
+                status: .pendingLateArrival,
+                attemptCount: 1,
+                firstSeenAt: now.addingTimeInterval(-240),
+                lastAttemptAt: now.addingTimeInterval(-240),
+                nextRetryAt: now.addingTimeInterval(-180)
+            )
+        ]
+        #expect(HealthSyncEngine.shouldRefreshWorkoutEnrichment(
+            updatedRawTypes: ["HKQuantityTypeIdentifierHeartRate"],
+            workoutState: workoutState,
+            enrichmentState: enrichmentState,
+            now: now
+        ))
+    }
+}
+
+// MARK: - Route lifecycle, retry, idempotent re-upload & audit tests
+
+actor MockWorkoutRouteDataSource: WorkoutRouteDataSource {
+    var candidates: [WorkoutRouteCandidate]
+    var routesByWorkout: [UUID: Result<[RoutePayload], Error>]
+    private(set) var queriedWorkoutUUIDs: [UUID] = []
+
+    init(
+        candidates: [WorkoutRouteCandidate],
+        routesByWorkout: [UUID: Result<[RoutePayload], Error>] = [:]
+    ) {
+        self.candidates = candidates
+        self.routesByWorkout = routesByWorkout
+    }
+
+    func setRouteResult(_ result: Result<[RoutePayload], Error>, for uuid: UUID) {
+        routesByWorkout[uuid] = result
+    }
+
+    func fetchWorkoutCandidates(endedAfter: Date) async throws -> [WorkoutRouteCandidate] {
+        candidates
+            .filter { $0.endDate >= endedAfter }
+            .sorted { $0.endDate < $1.endDate }
+    }
+
+    func routePayloads(for candidate: WorkoutRouteCandidate) async throws -> [RoutePayload] {
+        queriedWorkoutUUIDs.append(candidate.uuid)
+        guard let outcome = routesByWorkout[candidate.uuid] else { return [] }
+        return try outcome.get()
+    }
+}
+
+actor ReceiptVerifyingTransport: SyncTransport {
+    private(set) var batches: [SyncBatch] = []
+    private var nextOutcome: (@Sendable (SyncBatch) throws -> UploadResult)?
+
+    func setNextOutcome(_ handler: (@Sendable (SyncBatch) throws -> UploadResult)?) {
+        nextOutcome = handler
+    }
+
+    func upload(_ batch: SyncBatch) async throws -> UploadResult {
+        if let handler = nextOutcome {
+            let result = try handler(batch)
+            batches.append(batch)
+            return result
+        }
+        batches.append(batch)
+        let routePoints = batch.routes.reduce(0) { $0 + $1.points.count }
+        let seriesPoints = batch.series.reduce(0) { $0 + $1.points.count }
+        return UploadResult(
+            bytesSent: 128,
+            duration: 0.01,
+            receipt: IngestReceipt(accepted: batch.samples.count, routePoints: routePoints, seriesPoints: seriesPoints)
+        )
+    }
+}
+
+@Suite struct WorkoutRouteLifecycleAndAuditTests {
+    private func makeDir() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("puls-route-tests-\(UUID())", isDirectory: true)
+    }
+
+    private func makeEngine() async -> (HealthSyncEngine, SyncStateStore, ReceiptVerifyingTransport) {
+        let store = SyncStateStore(directory: makeDir(), tokenStore: InMemoryTokenStore())
+        await store.setConfiguration(SyncConfiguration(
+            enabledTypes: [HealthTypeCatalog.workoutIdentifier],
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            serverURL: URL(string: "https://example.test")!,
+            authToken: "secret-token",
+            includeWorkoutRoutes: true,
+            includeWorkoutEnhancedData: true
+        ))
+        let engine = HealthSyncEngine(store: store)
+        let transport = ReceiptVerifyingTransport()
+        await engine.setTransport(transport)
+        return (engine, store, transport)
+    }
+
+    private func makePayload(for uuid: UUID, points: Int, baseTime: Date = Date(timeIntervalSince1970: 1_700_000_100)) -> RoutePayload {
+        RoutePayload(
+            workoutUUID: uuid,
+            points: (0..<points).map { idx in
+                RoutePoint(
+                    t: baseTime.addingTimeInterval(Double(idx)),
+                    lat: 37.7749 + Double(idx) * 0.0001,
+                    lon: -122.4194 - Double(idx) * 0.0001
+                )
+            }
+        )
+    }
+
+    @Test func routePresentUploadsVerifiesReceiptAndMarksVerified() async {
+        let (engine, store, transport) = await makeEngine()
+        let now = Date(timeIntervalSince1970: 1_700_010_000)
+        let walkUUID = UUID()
+        let candidate = WorkoutRouteCandidate(
+            uuid: walkUUID,
+            activityType: .walking,
+            startDate: now.addingTimeInterval(-2_400),
+            endDate: now.addingTimeInterval(-600),
+            isExplicitlyIndoor: false
+        )
+        let ds = MockWorkoutRouteDataSource(
+            candidates: [candidate],
+            routesByWorkout: [walkUUID: .success([makePayload(for: walkUUID, points: 120)])]
+        )
+
+        await engine.syncWorkoutRoutes(using: ds, now: now)
+
+        let uploaded = await transport.batches
+        #expect(uploaded.count == 1)
+        #expect(uploaded[0].routes.first?.points.count == 120)
+
+        let record = await store.workoutRouteRecord(for: walkUUID)
+        #expect(record?.status == .verified)
+        #expect(record?.verifiedPointCount == 120)
+        #expect(record?.isExplicitlyIndoor == false)
+        #expect(await store.workoutEnrichmentState(.routes).computedThrough == now)
+    }
+
+    @Test func lateArrivingWatchRouteStaysPendingThenUploadsOnRetry() async {
+        let (engine, store, transport) = await makeEngine()
+        let now = Date(timeIntervalSince1970: 1_700_010_000)
+        let walkUUID = UUID()
+        // Outdoor walk ended 60s ago; Apple Watch has not transferred HKWorkoutRoute yet.
+        let candidate = WorkoutRouteCandidate(
+            uuid: walkUUID,
+            activityType: .walking,
+            startDate: now.addingTimeInterval(-1_900),
+            endDate: now.addingTimeInterval(-60),
+            isExplicitlyIndoor: false
+        )
+        let ds = MockWorkoutRouteDataSource(
+            candidates: [candidate],
+            routesByWorkout: [walkUUID: .success([])]
+        )
+
+        // First wake: 0 points returned. Must record .pendingLateArrival and hold watermark.
+        await engine.syncWorkoutRoutes(using: ds, now: now)
+        #expect(await transport.batches.isEmpty)
+        let pendingRecord = await store.workoutRouteRecord(for: walkUUID)
+        #expect(pendingRecord?.status == .pendingLateArrival)
+        #expect(pendingRecord?.attemptCount == 1)
+        #expect(pendingRecord?.nextRetryAt == now.addingTimeInterval(60))
+        #expect(await store.workoutEnrichmentState(.routes).computedThrough == nil)
+
+        // Audit while pending reports the workout in pendingLateArrival (never indoor).
+        let midAudit = await engine.auditWorkoutRoutes(using: ds, now: now, repairMissing: false)
+        #expect(midAudit.pendingLateArrival == [walkUUID])
+        #expect(midAudit.indoorSkipped.isEmpty)
+
+        // Second wake 2 minutes later: Apple Watch finished transferring 1,878 route points.
+        await ds.setRouteResult(.success([makePayload(for: walkUUID, points: 1_878)]), for: walkUUID)
+        let retryTime = now.addingTimeInterval(120)
+        await engine.syncWorkoutRoutes(using: ds, now: retryTime)
+
+        #expect(await transport.batches.count == 1)
+        let verifiedRecord = await store.workoutRouteRecord(for: walkUUID)
+        #expect(verifiedRecord?.status == .verified)
+        #expect(verifiedRecord?.verifiedPointCount == 1_878)
+        #expect(verifiedRecord?.attemptCount == 2)
+        #expect(await store.workoutEnrichmentState(.routes).computedThrough == retryTime)
+    }
+
+    @Test func noRouteInHealthKitAfterGraceWindowIsNeverClassifiedIndoor() async {
+        let (engine, store, transport) = await makeEngine()
+        let now = Date(timeIntervalSince1970: 1_700_200_000)
+        let runUUID = UUID()
+        // Outdoor run ended 30 hours ago (past the 24h Watch transfer grace window) with no route.
+        let candidate = WorkoutRouteCandidate(
+            uuid: runUUID,
+            activityType: .running,
+            startDate: now.addingTimeInterval(-31 * 3_600),
+            endDate: now.addingTimeInterval(-30 * 3_600),
+            isExplicitlyIndoor: false
+        )
+        let ds = MockWorkoutRouteDataSource(
+            candidates: [candidate],
+            routesByWorkout: [runUUID: .success([])]
+        )
+
+        await engine.syncWorkoutRoutes(using: ds, now: now)
+        #expect(await transport.batches.isEmpty)
+
+        let record = await store.workoutRouteRecord(for: runUUID)
+        #expect(record?.status == .noRouteInHealthKit)
+        #expect(record?.isExplicitlyIndoor == false)
+        #expect(await store.workoutEnrichmentState(.routes).computedThrough == now)
+
+        let audit = await engine.auditWorkoutRoutes(using: ds, now: now, repairMissing: false)
+        #expect(audit.noRouteInHealthKit == [runUUID])
+        #expect(audit.indoorSkipped.isEmpty)
+    }
+
+    @Test func healthKitReadErrorPreservesFailureReasonHoldsWatermarkAndSucceedsOnRetry() async {
+        let (engine, store, transport) = await makeEngine()
+        let now = Date(timeIntervalSince1970: 1_700_050_000)
+        let hikeUUID = UUID()
+        let routeUUID = UUID()
+        let candidate = WorkoutRouteCandidate(
+            uuid: hikeUUID,
+            activityType: .hiking,
+            startDate: now.addingTimeInterval(-3_600),
+            endDate: now.addingTimeInterval(-600),
+            isExplicitlyIndoor: false
+        )
+        let readErr = WorkoutRouteReadError.locationStreamFailed(
+            workoutUUID: hikeUUID,
+            routeUUID: routeUUID,
+            underlying: NSError(domain: HKErrorDomain, code: HKError.Code.errorHealthDataUnavailable.rawValue)
+        )
+        let ds = MockWorkoutRouteDataSource(
+            candidates: [candidate],
+            routesByWorkout: [hikeUUID: .failure(readErr)]
+        )
+
+        await engine.syncWorkoutRoutes(using: ds, now: now)
+        #expect(await transport.batches.isEmpty)
+
+        let failedRecord = await store.workoutRouteRecord(for: hikeUUID)
+        #expect(failedRecord?.status == .readFailed)
+        #expect(failedRecord?.lastErrorPhase == "route_location_stream")
+        #expect(failedRecord?.lastErrorMessage?.contains(hikeUUID.uuidString) == true)
+        #expect(await store.workoutEnrichmentState(.routes).computedThrough == nil)
+
+        let audit = await engine.auditWorkoutRoutes(using: ds, now: now, repairMissing: false)
+        #expect(audit.readFailed == [hikeUUID])
+
+        // Retry when HealthKit succeeds -> transitions to .verified and advances watermark.
+        await ds.setRouteResult(.success([makePayload(for: hikeUUID, points: 350)]), for: hikeUUID)
+        let retryNow = now.addingTimeInterval(120)
+        await engine.syncWorkoutRoutes(using: ds, now: retryNow)
+
+        #expect(await transport.batches.count == 1)
+        let verified = await store.workoutRouteRecord(for: hikeUUID)
+        #expect(verified?.status == .verified)
+        #expect(verified?.verifiedPointCount == 350)
+        #expect(verified?.lastErrorMessage == nil)
+        #expect(await store.workoutEnrichmentState(.routes).computedThrough == retryNow)
+    }
+
+    @Test func uploadErrorAndReceiptMismatchHoldWatermarkAndSucceedOnRetry() async {
+        let (engine, store, transport) = await makeEngine()
+        let now = Date(timeIntervalSince1970: 1_700_050_000)
+        let cycleUUID = UUID()
+        let candidate = WorkoutRouteCandidate(
+            uuid: cycleUUID,
+            activityType: .cycling,
+            startDate: now.addingTimeInterval(-3_600),
+            endDate: now.addingTimeInterval(-300),
+            isExplicitlyIndoor: false
+        )
+        let ds = MockWorkoutRouteDataSource(
+            candidates: [candidate],
+            routesByWorkout: [cycleUUID: .success([makePayload(for: cycleUUID, points: 200)])]
+        )
+
+        // Attempt 1: server returns receipt acknowledging only 50 of 200 route points.
+        await transport.setNextOutcome { _ in
+            UploadResult(bytesSent: 64, duration: 0.01, receipt: IngestReceipt(routePoints: 50))
+        }
+        await engine.syncWorkoutRoutes(using: ds, now: now)
+
+        var record = await store.workoutRouteRecord(for: cycleUUID)
+        #expect(record?.status == .uploadFailed)
+        #expect(record?.lastErrorPhase == "receipt_verification")
+        #expect(record?.expectedPointCount == 200)
+        #expect(record?.verifiedPointCount == 0)
+        #expect(await store.workoutEnrichmentState(.routes).computedThrough == nil)
+
+        // Attempt 2: network/server error throws during upload.
+        await transport.setNextOutcome { _ in
+            throw TransportError.serverError(status: 503, body: "Temporarily unavailable")
+        }
+        await engine.syncWorkoutRoutes(using: ds, now: now.addingTimeInterval(120))
+
+        record = await store.workoutRouteRecord(for: cycleUUID)
+        #expect(record?.status == .uploadFailed)
+        #expect(record?.lastErrorPhase == "route_upload")
+        #expect(record?.attemptCount == 2)
+        #expect(await store.workoutEnrichmentState(.routes).computedThrough == nil)
+
+        // Attempt 3: server accepts and acknowledges all 200 points.
+        await transport.setNextOutcome(nil)
+        let finalNow = now.addingTimeInterval(300)
+        await engine.syncWorkoutRoutes(using: ds, now: finalNow)
+
+        record = await store.workoutRouteRecord(for: cycleUUID)
+        #expect(record?.status == .verified)
+        #expect(record?.verifiedPointCount == 200)
+        #expect(await store.workoutEnrichmentState(.routes).computedThrough == finalNow)
+    }
+
+    @Test func idempotentReuploadSkipsVerifiedUnlessPointsGrowOrForced() async {
+        let (engine, store, transport) = await makeEngine()
+        let now = Date(timeIntervalSince1970: 1_700_050_000)
+        let runUUID = UUID()
+        let candidate = WorkoutRouteCandidate(
+            uuid: runUUID,
+            activityType: .running,
+            startDate: now.addingTimeInterval(-1_800),
+            endDate: now.addingTimeInterval(-300),
+            isExplicitlyIndoor: false
+        )
+        let ds = MockWorkoutRouteDataSource(
+            candidates: [candidate],
+            routesByWorkout: [runUUID: .success([makePayload(for: runUUID, points: 400)])]
+        )
+
+        // Initial upload -> 1 batch sent.
+        await engine.syncWorkoutRoutes(using: ds, now: now)
+        #expect(await transport.batches.count == 1)
+
+        // Ordinary subsequent wake with same 400 points -> skipped (0 additional batches).
+        await engine.syncWorkoutRoutes(using: ds, now: now.addingTimeInterval(600))
+        #expect(await transport.batches.count == 1)
+
+        // Apple Watch finishes transferring additional route segment (400 -> 650 points) -> uploads!
+        await ds.setRouteResult(.success([makePayload(for: runUUID, points: 650)]), for: runUUID)
+        await engine.syncWorkoutRoutes(using: ds, now: now.addingTimeInterval(900))
+        #expect(await transport.batches.count == 2)
+        #expect(await store.workoutRouteRecord(for: runUUID)?.verifiedPointCount == 650)
+
+        // Forced idempotent re-upload (e.g. reconciliation) where server returns routePoints: 0
+        // because all 650 points are already in workout_route_points (`ON CONFLICT DO NOTHING`).
+        await transport.setNextOutcome { _ in
+            UploadResult(bytesSent: 128, duration: 0.01, receipt: IngestReceipt(routePoints: 0))
+        }
+        await engine.syncWorkoutRoutes(using: ds, reason: .reconciliation, now: now.addingTimeInterval(1_200), forceReupload: true)
+        #expect(await transport.batches.count == 3)
+        #expect(await store.workoutRouteRecord(for: runUUID)?.status == .verified)
+    }
+
+    @Test func indoorAndNonRouteWorkoutsSkipRouteQueriesEfficiently() async {
+        let (engine, store, transport) = await makeEngine()
+        let now = Date(timeIntervalSince1970: 1_700_050_000)
+        let strengthUUID = UUID()
+        let indoorWalkUUID = UUID()
+        let outdoorWalkUUID = UUID()
+
+        let candidates = [
+            WorkoutRouteCandidate(
+                uuid: strengthUUID,
+                activityType: .traditionalStrengthTraining,
+                startDate: now.addingTimeInterval(-7_200),
+                endDate: now.addingTimeInterval(-5_400),
+                isExplicitlyIndoor: nil
+            ),
+            WorkoutRouteCandidate(
+                uuid: indoorWalkUUID,
+                activityType: .walking,
+                startDate: now.addingTimeInterval(-3_600),
+                endDate: now.addingTimeInterval(-1_800),
+                isExplicitlyIndoor: true
+            ),
+            WorkoutRouteCandidate(
+                uuid: outdoorWalkUUID,
+                activityType: .walking,
+                startDate: now.addingTimeInterval(-1_200),
+                endDate: now.addingTimeInterval(-300),
+                isExplicitlyIndoor: false
+            ),
+        ]
+        let ds = MockWorkoutRouteDataSource(
+            candidates: candidates,
+            routesByWorkout: [outdoorWalkUUID: .success([makePayload(for: outdoorWalkUUID, points: 90)])]
+        )
+
+        let report = await engine.auditWorkoutRoutes(using: ds, now: now, repairMissing: true)
+
+        // Only the outdoor walk should have queried HealthKit for HKWorkoutRoute!
+        #expect(await ds.queriedWorkoutUUIDs == [outdoorWalkUUID])
+        #expect(await transport.batches.count == 1)
+        #expect(await store.workoutRouteRecord(for: indoorWalkUUID)?.status == .indoorWorkout)
+        #expect(report.nonRouteSkipped == [strengthUUID])
+        #expect(report.indoorSkipped == [indoorWalkUUID])
+        #expect(report.verified == [outdoorWalkUUID])
+        #expect(report.unresolvedRouteCapableUUIDs.isEmpty)
+    }
+}
+
+

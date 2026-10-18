@@ -2,6 +2,47 @@ import Foundation
 import HealthKit
 import CoreLocation
 
+/// Structured error thrown when reading `HKWorkoutRoute` samples or their
+/// `CLLocation` stream fails, preserving the workout UUID and the read phase.
+public enum WorkoutRouteReadError: Error, LocalizedError, Sendable {
+    case routeQueryFailed(workoutUUID: UUID, underlying: Error)
+    case locationStreamFailed(workoutUUID: UUID, routeUUID: UUID, underlying: Error)
+
+    public var phase: String {
+        switch self {
+        case .routeQueryFailed:
+            return "route_query"
+        case .locationStreamFailed:
+            return "route_location_stream"
+        }
+    }
+
+    public var workoutUUID: UUID {
+        switch self {
+        case .routeQueryFailed(let workoutUUID, _),
+             .locationStreamFailed(let workoutUUID, _, _):
+            return workoutUUID
+        }
+    }
+
+    public var underlyingError: Error {
+        switch self {
+        case .routeQueryFailed(_, let underlying),
+             .locationStreamFailed(_, _, let underlying):
+            return underlying
+        }
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case .routeQueryFailed(let workoutUUID, let underlying):
+            return "Route sample query failed for workout \(workoutUUID): \(underlying.localizedDescription)"
+        case .locationStreamFailed(let workoutUUID, let routeUUID, let underlying):
+            return "Route location stream failed for workout \(workoutUUID) (route \(routeUUID)): \(underlying.localizedDescription)"
+        }
+    }
+}
+
 /// Fetches the secondary data attached to series-style samples: heartbeat offsets,
 /// ECG voltage traces, workout GPS routes, and workout effort scores. These all
 /// require follow-up queries that `SampleMapper` (synchronous) can't run.
@@ -44,27 +85,44 @@ struct SeriesEnricher: Sendable {
             type: HKSeriesType.workoutRoute(),
             predicate: HKQuery.predicateForObjects(from: workout)
         )
-        let routes = try await HKSampleQueryDescriptor(
-            predicates: [routePredicate], sortDescriptors: []
-        ).result(for: healthStore)
+        let rawRoutes: [HKSample]
+        do {
+            rawRoutes = try await HKSampleQueryDescriptor(
+                predicates: [routePredicate],
+                sortDescriptors: [SortDescriptor(\.startDate, order: .forward)]
+            ).result(for: healthStore)
+        } catch {
+            throw WorkoutRouteReadError.routeQueryFailed(workoutUUID: workout.uuid, underlying: error)
+        }
+
+        let routes = rawRoutes.compactMap { $0 as? HKWorkoutRoute }.sorted {
+            if $0.startDate != $1.startDate { return $0.startDate < $1.startDate }
+            return $0.uuid.uuidString < $1.uuid.uuidString
+        }
 
         var points: [RoutePoint] = []
-        for case let route as HKWorkoutRoute in routes {
-            for try await location in HKWorkoutRouteQueryDescriptor(route).results(for: healthStore) {
-                points.append(RoutePoint(
-                    t: location.timestamp,
-                    temporalContext: .deviceCurrent(for: location.timestamp),
-                    lat: location.coordinate.latitude,
-                    lon: location.coordinate.longitude,
-                    alt: location.verticalAccuracy >= 0 ? location.altitude : nil,
-                    hAcc: location.horizontalAccuracy >= 0 ? location.horizontalAccuracy : nil,
-                    vAcc: location.verticalAccuracy >= 0 ? location.verticalAccuracy : nil,
-                    speed: location.speed >= 0 ? location.speed : nil,
-                    course: location.course >= 0 ? location.course : nil
-                ))
+        for route in routes {
+            do {
+                for try await location in HKWorkoutRouteQueryDescriptor(route).results(for: healthStore) {
+                    points.append(RoutePoint(
+                        t: location.timestamp,
+                        temporalContext: .deviceCurrent(for: location.timestamp),
+                        lat: location.coordinate.latitude,
+                        lon: location.coordinate.longitude,
+                        alt: location.verticalAccuracy >= 0 ? location.altitude : nil,
+                        hAcc: location.horizontalAccuracy >= 0 ? location.horizontalAccuracy : nil,
+                        vAcc: location.verticalAccuracy >= 0 ? location.verticalAccuracy : nil,
+                        speed: location.speed >= 0 ? location.speed : nil,
+                        course: location.course >= 0 ? location.course : nil
+                    ))
+                }
+            } catch {
+                throw WorkoutRouteReadError.locationStreamFailed(
+                    workoutUUID: workout.uuid, routeUUID: route.uuid, underlying: error)
             }
         }
         guard !points.isEmpty else { return [] }
+        points.sort { $0.t < $1.t }
         return stride(from: 0, to: points.count, by: RoutePayload.maxPointsPerPayload).map {
             RoutePayload(
                 workoutUUID: workout.uuid,
@@ -96,8 +154,9 @@ struct SeriesEnricher: Sendable {
     /// them as "no data" would advance the enrichment watermark past workouts that
     /// were never actually read.
     static func isPhaseAbortingError(_ error: Error) -> Bool {
-        if error is CancellationError { return true }
-        guard let hk = error as? HKError else { return false }
+        let unwrapped = (error as? WorkoutRouteReadError)?.underlyingError ?? error
+        if unwrapped is CancellationError { return true }
+        guard let hk = unwrapped as? HKError else { return false }
         return hk.code == .errorDatabaseInaccessible
             || hk.code == .errorAuthorizationNotDetermined
     }

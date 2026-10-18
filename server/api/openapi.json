@@ -1811,6 +1811,34 @@
               true
             ]
           },
+          "routePointCount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of GPS route points synced for this workout.",
+            "examples": [
+              1420
+            ]
+          },
+          "isIndoor": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether HealthKit metadata (`HKIndoorWorkout`) explicitly marks this workout as indoor (`true`) or outdoor (`false`). Omitted when the metadata key was not recorded.",
+            "examples": [
+              false
+            ]
+          },
+          "elevationAscendedM": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Total elevation ascended in metres (`HKElevationAscended`) when present in HealthKit workout metadata.",
+            "examples": [
+              42.8
+            ]
+          },
           "availableMetrics": {
             "type": "array",
             "items": {

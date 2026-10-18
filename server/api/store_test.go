@@ -467,8 +467,9 @@ func TestIntegrationWorkoutFixture(t *testing.T) {
 	}()
 
 	if _, err := admin.Exec(ctx, `
-		INSERT INTO workouts (uuid, activity_type, start_ts, end_ts, duration_s, energy_kcal, distance_m, user_id, stats_detail, events, activities)
+		INSERT INTO workouts (uuid, activity_type, start_ts, end_ts, duration_s, energy_kcal, distance_m, user_id, metadata, stats_detail, events, activities)
 		VALUES ($1, 'HKWorkoutActivityTypeRunning', $2, $3, 2700, 500, 6000, $4,
+		        '{"HKIndoorWorkout":0,"HKElevationAscended":42.5}'::jsonb,
 		        '{"`+identifier+`":{"avg":68,"max":175}}'::jsonb,
 		        '[{"kind":"lap","lap":1}]'::jsonb,
 		        '[{"activityType":"HKWorkoutActivityTypeRunning"}]'::jsonb)`,
@@ -477,8 +478,8 @@ func TestIntegrationWorkoutFixture(t *testing.T) {
 		t.Fatalf("insert workout: %v", err)
 	}
 	if _, err := admin.Exec(ctx, `
-		INSERT INTO workouts (uuid, activity_type, start_ts, end_ts, duration_s, user_id)
-		VALUES ($1, 'HKWorkoutActivityTypeRunning', $2, $3, 2700, $4)`,
+		INSERT INTO workouts (uuid, activity_type, start_ts, end_ts, duration_s, user_id, metadata)
+		VALUES ($1, 'HKWorkoutActivityTypeRunning', $2, $3, 2700, $4, '{"HKIndoorWorkout":1}'::jsonb)`,
 		workoutUUID2, start, end, defaultUserID,
 	); err != nil {
 		t.Fatalf("insert tied-start workout: %v", err)
@@ -510,6 +511,15 @@ func TestIntegrationWorkoutFixture(t *testing.T) {
 	}
 	if !detail.HasRoute {
 		t.Fatal("hasRoute = false, want true")
+	}
+	if detail.RoutePointCount != 1 {
+		t.Fatalf("routePointCount = %d, want 1", detail.RoutePointCount)
+	}
+	if detail.IsIndoor == nil || *detail.IsIndoor {
+		t.Fatalf("isIndoor = %v, want false", detail.IsIndoor)
+	}
+	if detail.ElevationAscendedM == nil || *detail.ElevationAscendedM != 42.5 {
+		t.Fatalf("elevationAscendedM = %v, want 42.5", detail.ElevationAscendedM)
 	}
 	if len(detail.AvailableMetrics) != 1 || detail.AvailableMetrics[0] != identifier {
 		t.Fatalf("availableMetrics = %#v, want [%q]", detail.AvailableMetrics, identifier)

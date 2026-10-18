@@ -111,15 +111,18 @@ type WorkoutFilters struct {
 }
 
 type WorkoutSummary struct {
-	UUID             string   `json:"uuid"`
-	ActivityType     string   `json:"activityType"`
-	Start            int64    `json:"start"`
-	End              int64    `json:"end"`
-	DurationS        *float64 `json:"durationS"`
-	DistanceM        *float64 `json:"distanceM"`
-	EnergyKcal       *float64 `json:"energyKcal"`
-	HasRoute         bool     `json:"hasRoute"`
-	AvailableMetrics []string `json:"availableMetrics"`
+	UUID               string   `json:"uuid"`
+	ActivityType       string   `json:"activityType"`
+	Start              int64    `json:"start"`
+	End                int64    `json:"end"`
+	DurationS          *float64 `json:"durationS"`
+	DistanceM          *float64 `json:"distanceM"`
+	EnergyKcal         *float64 `json:"energyKcal"`
+	HasRoute           bool     `json:"hasRoute"`
+	RoutePointCount    int64    `json:"routePointCount"`
+	IsIndoor           *bool    `json:"isIndoor,omitempty"`
+	ElevationAscendedM *float64 `json:"elevationAscendedM,omitempty"`
+	AvailableMetrics   []string `json:"availableMetrics"`
 }
 
 type WorkoutStatDetail struct {
@@ -415,9 +418,33 @@ func (st *Store) ActivitySummary(ctx context.Context, userID string, start, end 
 const workoutSummarySQL = `
 	SELECT w.uuid::text, w.activity_type, w.start_ts, w.end_ts,
 	       w.duration_s::float8, w.distance_m::float8, w.energy_kcal::float8,
-	       EXISTS (SELECT 1 FROM workout_route_points r WHERE r.workout_uuid = w.uuid AND r.user_id = w.user_id) AS has_route,
+	       COALESCE(route_points.route_point_count, 0) > 0 AS has_route,
+	       COALESCE(route_points.route_point_count, 0) AS route_point_count,
+	       CASE
+	           WHEN w.metadata ? 'HKIndoorWorkout' THEN
+	               CASE lower(w.metadata->>'HKIndoorWorkout')
+	                   WHEN '1' THEN TRUE
+	                   WHEN 'true' THEN TRUE
+	                   WHEN '0' THEN FALSE
+	                   WHEN 'false' THEN FALSE
+	                   ELSE NULL
+	               END
+	           ELSE NULL
+	       END AS is_indoor,
+	       CASE
+	           WHEN jsonb_typeof(w.metadata->'HKElevationAscended') = 'number'
+	                OR (w.metadata ? 'HKElevationAscended' AND (w.metadata->>'HKElevationAscended') ~ '^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$')
+	           THEN (w.metadata->>'HKElevationAscended')::float8
+	           ELSE NULL
+	       END AS elevation_ascended_m,
 	       COALESCE(metric_streams.available_metrics, ARRAY[]::text[]) AS available_metrics
 	FROM workouts w
+	LEFT JOIN LATERAL (
+	  SELECT count(*)::bigint AS route_point_count
+	  FROM workout_route_points r
+	  WHERE r.workout_uuid = w.uuid
+	    AND r.user_id = w.user_id
+	) route_points ON TRUE
 	LEFT JOIN LATERAL (
 	  SELECT array_agg(DISTINCT st.identifier ORDER BY st.identifier) AS available_metrics
 	  FROM workout_series_points wsp
@@ -487,10 +514,34 @@ func (st *Store) Workout(ctx context.Context, userID, uuid string) (*WorkoutDeta
 	row := st.pool.QueryRow(ctx, `
 		SELECT w.uuid::text, w.activity_type, w.start_ts, w.end_ts,
 		       w.duration_s::float8, w.distance_m::float8, w.energy_kcal::float8,
-		       EXISTS (SELECT 1 FROM workout_route_points r WHERE r.workout_uuid = w.uuid AND r.user_id = w.user_id) AS has_route,
+		       COALESCE(route_points.route_point_count, 0) > 0 AS has_route,
+		       COALESCE(route_points.route_point_count, 0) AS route_point_count,
+		       CASE
+		           WHEN w.metadata ? 'HKIndoorWorkout' THEN
+		               CASE lower(w.metadata->>'HKIndoorWorkout')
+		                   WHEN '1' THEN TRUE
+		                   WHEN 'true' THEN TRUE
+		                   WHEN '0' THEN FALSE
+		                   WHEN 'false' THEN FALSE
+		                   ELSE NULL
+		               END
+		           ELSE NULL
+		       END AS is_indoor,
+		       CASE
+		           WHEN jsonb_typeof(w.metadata->'HKElevationAscended') = 'number'
+		                OR (w.metadata ? 'HKElevationAscended' AND (w.metadata->>'HKElevationAscended') ~ '^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$')
+		           THEN (w.metadata->>'HKElevationAscended')::float8
+		           ELSE NULL
+		       END AS elevation_ascended_m,
 		       COALESCE(metric_streams.available_metrics, ARRAY[]::text[]) AS available_metrics,
 		       w.stats_detail, w.events, w.activities
 		FROM workouts w
+		LEFT JOIN LATERAL (
+		  SELECT count(*)::bigint AS route_point_count
+		  FROM workout_route_points r
+		  WHERE r.workout_uuid = w.uuid
+		    AND r.user_id = w.user_id
+		) route_points ON TRUE
 		LEFT JOIN LATERAL (
 		  SELECT array_agg(DISTINCT st.identifier ORDER BY st.identifier) AS available_metrics
 		  FROM workout_series_points wsp
@@ -549,6 +600,9 @@ func scanWorkoutSummary(scanner interface {
 		&summary.DistanceM,
 		&summary.EnergyKcal,
 		&summary.HasRoute,
+		&summary.RoutePointCount,
+		&summary.IsIndoor,
+		&summary.ElevationAscendedM,
 		&summary.AvailableMetrics,
 	); err != nil {
 		return WorkoutSummary{}, err
@@ -573,6 +627,9 @@ func scanWorkoutSummaryRow(
 		&summary.DistanceM,
 		&summary.EnergyKcal,
 		&summary.HasRoute,
+		&summary.RoutePointCount,
+		&summary.IsIndoor,
+		&summary.ElevationAscendedM,
 		&summary.AvailableMetrics,
 		statsDetailJSON,
 		eventsJSON,

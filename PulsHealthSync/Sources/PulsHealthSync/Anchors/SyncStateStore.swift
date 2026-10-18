@@ -201,6 +201,107 @@ public enum WorkoutEnrichmentKind: String, Codable, Sendable, CaseIterable, Hash
     case streams
 }
 
+/// The explicit route-sync state of a workout. Missing routes are never
+/// inferred to mean an indoor workout: `indoorWorkout` is set only when
+/// HealthKit metadata explicitly reports `HKIndoorWorkout == true`.
+public enum WorkoutRouteStatus: String, Codable, Sendable, Equatable {
+    /// Route points were read from HealthKit, uploaded, and acknowledged by the server.
+    case verified = "verified"
+    /// Route-capable workout returned 0 route points while Apple Watch data may still be arriving.
+    case pendingLateArrival = "pending_late_route"
+    /// Route-capable workout still had 0 route points in HealthKit after the late-arrival grace window.
+    case noRouteInHealthKit = "no_route_in_healthkit"
+    /// Querying `HKWorkoutRoute` or streaming its `CLLocation` points failed.
+    case readFailed = "route_read_failed"
+    /// Uploading route batches or verifying the server's route-point receipt failed.
+    case uploadFailed = "route_upload_failed"
+    /// Workout metadata explicitly set `HKIndoorWorkout == true`.
+    case indoorWorkout = "indoor_workout"
+}
+
+/// Durable per-workout route enrichment record stored in `WorkoutEnrichmentState.routeRecords`.
+public struct WorkoutRouteSyncRecord: Codable, Sendable, Equatable {
+    public var workoutUUID: UUID
+    public var activityTypeRaw: UInt
+    public var workoutStart: Date
+    public var workoutEnd: Date
+    public var isExplicitlyIndoor: Bool?
+    public var status: WorkoutRouteStatus
+    public var attemptCount: Int
+    public var firstSeenAt: Date
+    public var lastAttemptAt: Date
+    public var nextRetryAt: Date?
+    public var expectedPointCount: Int
+    public var verifiedPointCount: Int
+    public var verifiedAt: Date?
+    public var lastErrorPhase: String?
+    public var lastErrorMessage: String?
+
+    public init(
+        workoutUUID: UUID,
+        activityTypeRaw: UInt,
+        workoutStart: Date,
+        workoutEnd: Date,
+        isExplicitlyIndoor: Bool? = nil,
+        status: WorkoutRouteStatus,
+        attemptCount: Int = 1,
+        firstSeenAt: Date = Date(),
+        lastAttemptAt: Date = Date(),
+        nextRetryAt: Date? = nil,
+        expectedPointCount: Int = 0,
+        verifiedPointCount: Int = 0,
+        verifiedAt: Date? = nil,
+        lastErrorPhase: String? = nil,
+        lastErrorMessage: String? = nil
+    ) {
+        self.workoutUUID = workoutUUID
+        self.activityTypeRaw = activityTypeRaw
+        self.workoutStart = workoutStart
+        self.workoutEnd = workoutEnd
+        self.isExplicitlyIndoor = isExplicitlyIndoor
+        self.status = status
+        self.attemptCount = attemptCount
+        self.firstSeenAt = firstSeenAt
+        self.lastAttemptAt = lastAttemptAt
+        self.nextRetryAt = nextRetryAt
+        self.expectedPointCount = expectedPointCount
+        self.verifiedPointCount = verifiedPointCount
+        self.verifiedAt = verifiedAt
+        self.lastErrorPhase = lastErrorPhase
+        self.lastErrorMessage = lastErrorMessage
+    }
+
+    /// True while the workout still requires a follow-up route query or upload retry.
+    public var needsRetry: Bool {
+        switch status {
+        case .pendingLateArrival, .readFailed, .uploadFailed:
+            return true
+        case .verified, .noRouteInHealthKit, .indoorWorkout:
+            return false
+        }
+    }
+
+    /// Whether this record is eligible for a retry at `now`.
+    public func isRetryDue(at now: Date) -> Bool {
+        guard needsRetry else { return false }
+        guard let nextRetryAt else { return true }
+        return now >= nextRetryAt
+    }
+
+    /// Backoff ladder for pending/failed workout routes:
+    /// 1m, 2m, 5m, 15m, 30m, then 60m thereafter.
+    public static func retryDelay(forAttempt attempt: Int) -> TimeInterval {
+        switch max(1, attempt) {
+        case 1: return 60
+        case 2: return 120
+        case 3: return 300
+        case 4: return 900
+        case 5: return 1_800
+        default: return 3_600
+        }
+    }
+}
+
 /// Everything we persist about one workout-enrichment phase's progress (GPS
 /// routes or intra-workout streams). Enrichment rides separate NDJSON lines
 /// (`{"route":...}` / `{"series":...}`) keyed on the workout UUID, so the basic
@@ -235,6 +336,9 @@ public struct WorkoutEnrichmentState: Codable, Sendable, Equatable {
     /// it, so a widened grant re-enriches from the start date. Nil =
     /// unlimited.
     public var readableSince: Date?
+    /// Per-workout route enrichment records, keyed by lowercase workout UUID string.
+    /// Optional so state files from earlier versions decode without migration.
+    public var routeRecords: [String: WorkoutRouteSyncRecord]?
 
     public init() {
         self.computedThrough = nil
@@ -249,6 +353,22 @@ public struct WorkoutEnrichmentState: Codable, Sendable, Equatable {
         self.totalBytesUploaded = 0
         self.lastError = nil
         self.lastErrorAt = nil
+        self.routeRecords = nil
+    }
+
+    /// True when any tracked workout has a pending/failed route whose retry timer is due at `now`.
+    public func hasDueRouteRetries(at now: Date = Date()) -> Bool {
+        guard let routeRecords else { return false }
+        return routeRecords.values.contains { $0.isRetryDue(at: now) }
+    }
+
+    /// Earliest `workoutEnd` among non-terminal (`pendingLateArrival`, `readFailed`, `uploadFailed`) workouts.
+    public var earliestPendingRouteWorkoutEnd: Date? {
+        guard let routeRecords else { return nil }
+        return routeRecords.values
+            .filter(\.needsRetry)
+            .map(\.workoutEnd)
+            .min()
     }
 }
 
@@ -1442,6 +1562,60 @@ public actor SyncStateStore {
     public func resetWorkoutEnrichment(_ kind: WorkoutEnrichmentKind) {
         setWorkoutEnrichmentState(kind, WorkoutEnrichmentState())
         persist()
+    }
+
+    // MARK: - Per-workout route status tracking
+
+    public func workoutRouteRecord(for workoutUUID: UUID) -> WorkoutRouteSyncRecord? {
+        workoutRoutesState.routeRecords?[workoutUUID.uuidString.lowercased()]
+    }
+
+    public func allWorkoutRouteRecords() -> [UUID: WorkoutRouteSyncRecord] {
+        guard let records = workoutRoutesState.routeRecords else { return [:] }
+        var out: [UUID: WorkoutRouteSyncRecord] = [:]
+        for record in records.values {
+            out[record.workoutUUID] = record
+        }
+        return out
+    }
+
+    public func recordWorkoutRouteStatus(_ record: WorkoutRouteSyncRecord) {
+        var scrubbed = record
+        if let msg = scrubbed.lastErrorMessage {
+            scrubbed.lastErrorMessage = ErrorScrubber.scrub(
+                msg, limit: ErrorScrubber.persistedLimit,
+                secrets: [configuration.authToken].compactMap { $0 })
+        }
+        updateWorkoutEnrichment(.routes) { s in
+            var map = s.routeRecords ?? [:]
+            map[scrubbed.workoutUUID.uuidString.lowercased()] = scrubbed
+            s.routeRecords = map
+        }
+    }
+
+    public func dueWorkoutRouteRetryRecords(at now: Date = Date()) -> [WorkoutRouteSyncRecord] {
+        guard let records = workoutRoutesState.routeRecords else { return [] }
+        return records.values
+            .filter { $0.isRetryDue(at: now) }
+            .sorted { $0.workoutEnd < $1.workoutEnd }
+    }
+
+    public func earliestPendingWorkoutRouteEnd() -> Date? {
+        workoutRoutesState.earliestPendingRouteWorkoutEnd
+    }
+
+    /// Prune terminal route records (`verified`, `noRouteInHealthKit`, `indoorWorkout`)
+    /// whose workout ended before `cutoff`, while retaining all pending/failed records.
+    public func pruneWorkoutRouteRecords(olderThan cutoff: Date) {
+        updateWorkoutEnrichment(.routes) { s in
+            guard let records = s.routeRecords, !records.isEmpty else { return }
+            let filtered = records.filter { _, record in
+                record.needsRetry || record.workoutEnd >= cutoff
+            }
+            if filtered.count != records.count {
+                s.routeRecords = filtered.isEmpty ? nil : filtered
+            }
+        }
     }
 
     // MARK: - Persistence

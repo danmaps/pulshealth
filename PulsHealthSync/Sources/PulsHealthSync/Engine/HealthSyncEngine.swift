@@ -818,6 +818,10 @@ public actor HealthSyncEngine {
         guard claimTypes([identifier]) == [identifier] else { return }
         await sendRecentWindows([identifier], reason: reason)
         await runClaimed(type: identifier, reason: reason)
+        if identifier == HealthTypeCatalog.workoutIdentifier, !Task.isCancelled {
+            await syncWorkoutRoutes(reason: reason)
+            await syncWorkoutStreams(reason: reason)
+        }
     }
 
     /// One type's run, repeated while observers asked for more during it, then
@@ -1170,11 +1174,53 @@ public actor HealthSyncEngine {
             var enrichment = WorkoutEnrichment()
             for i in samples.indices {
                 guard let workout = byUUID[samples[i].uuid] else { continue }
-                // Routes are best-effort: a workout without route access (or
-                // without GPS) just uploads with no points. Deferred in the raw sweep
-                // (the route phase owns the fetch).
-                if includeRoutes, !deferEnrichment {
-                    enrichment.routes += (try? await enricher.routePayloads(for: workout)) ?? []
+                // Routes are fetched primarily in the dedicated route phase
+                // (`deferEnrichment: true` in the raw sweep). When inline enrichment is
+                // requested (`deferEnrichment: false`), never swallow route errors silently:
+                // phase-aborting errors propagate, and per-workout route errors are
+                // recorded in `SyncStateStore` so the route phase retries them.
+                if includeRoutes, !deferEnrichment, Self.mayHaveWorkoutRoute(workout.workoutActivityType) {
+                    let isIndoor = WorkoutRouteCandidate.extractIndoorMetadata(from: workout.metadata)
+                    if isIndoor == true {
+                        let now = Date()
+                        await store.recordWorkoutRouteStatus(WorkoutRouteSyncRecord(
+                            workoutUUID: workout.uuid,
+                            activityTypeRaw: workout.workoutActivityType.rawValue,
+                            workoutStart: workout.startDate,
+                            workoutEnd: workout.endDate,
+                            isExplicitlyIndoor: true,
+                            status: .indoorWorkout,
+                            firstSeenAt: now,
+                            lastAttemptAt: now
+                        ))
+                    } else {
+                        do {
+                            enrichment.routes += try await enricher.routePayloads(for: workout)
+                        } catch {
+                            if SeriesEnricher.isPhaseAbortingError(error) { throw error }
+                            let now = Date()
+                            let existing = await store.workoutRouteRecord(for: workout.uuid)
+                            let attempts = (existing?.attemptCount ?? 0) + 1
+                            let phase = (error as? WorkoutRouteReadError)?.phase ?? "raw_enrich"
+                            await store.recordWorkoutRouteStatus(WorkoutRouteSyncRecord(
+                                workoutUUID: workout.uuid,
+                                activityTypeRaw: workout.workoutActivityType.rawValue,
+                                workoutStart: workout.startDate,
+                                workoutEnd: workout.endDate,
+                                isExplicitlyIndoor: isIndoor,
+                                status: .readFailed,
+                                attemptCount: attempts,
+                                firstSeenAt: existing?.firstSeenAt ?? now,
+                                lastAttemptAt: now,
+                                nextRetryAt: now.addingTimeInterval(WorkoutRouteSyncRecord.retryDelay(forAttempt: attempts)),
+                                lastErrorPhase: phase,
+                                lastErrorMessage: error.localizedDescription
+                            ))
+                            await eventLog.log(
+                                .warn, type: descriptor.identifier,
+                                "Inline workout route read failed (\(phase)) for workout \(workout.uuid): \(error) — queued for route retry")
+                        }
+                    }
                 }
                 if includeEnhanced {
                     // Full intra-workout curves (HR/power/cadence/speed/…), best-effort.
@@ -1494,10 +1540,12 @@ public actor HealthSyncEngine {
     /// Call this on every app launch (in `application(_:didFinishLaunchingWithOptions:)`
     /// or App init) — iOS relaunches the app in the background when new data arrives
     /// and the observer must already be registered when the update is delivered.
-    public func startObserving() async {
-        stopObserving()
-
-        let config = await store.configuration
+    /// Map every observed `HKSampleType` to the catalog identifier its delivery
+    /// should wake. When workouts and workout routes are enabled, `HKSeriesType.workoutRoute()`
+    /// is observed alongside `HKWorkoutType` and mapped to `HKWorkoutTypeIdentifier`
+    /// so GPS routes that finish transferring from Apple Watch after the workout
+    /// row itself trigger an observer wake and upload in the background.
+    nonisolated static func observedSampleTypes(for config: SyncConfiguration) -> [HKSampleType: String] {
         var typeToIdentifier: [HKSampleType: String] = [:]
         for id in config.observedTypeIdentifiers {
             guard !HealthTypeCatalog.usesPerObjectAuthorization(id) else { continue }
@@ -1505,6 +1553,18 @@ public actor HealthSyncEngine {
                 typeToIdentifier[sampleType] = id
             }
         }
+        if config.enabledTypes.contains(HealthTypeCatalog.workoutIdentifier),
+           config.includeWorkoutRoutes {
+            typeToIdentifier[HKSeriesType.workoutRoute()] = HealthTypeCatalog.workoutIdentifier
+        }
+        return typeToIdentifier
+    }
+
+    public func startObserving() async {
+        stopObserving()
+
+        let config = await store.configuration
+        let typeToIdentifier = Self.observedSampleTypes(for: config)
         guard !typeToIdentifier.isEmpty else { return }
         let queryDescriptors = typeToIdentifier.keys.map {
             HKQueryDescriptor(sampleType: $0, predicate: nil)
@@ -1677,6 +1737,11 @@ public actor HealthSyncEngine {
             // within the time this wake holds, rather than acknowledging
             // HealthKit at once and letting iOS suspend the app mid-page.
             await waitForRelease(of: Set(rawTypes), upTo: Self.observerWaitLimit)
+            // Raw workout pages defer routes and intra-workout streams (`deferEnrichment: true`
+            // in `MergedSync.queryPage`), so enrich workouts here whenever workouts (or
+            // `HKSeriesType.workoutRoute()`) updated or a recent workout still needs its
+            // late-arriving Watch route/series enriched.
+            await refreshWorkoutEnrichmentIfNeeded(updatedRawTypes: Set(rawTypes))
             // Aggregate-only types are observed too and must not get a
             // raw-sample sync, only their aggregate recomputes.
             await withTaskGroup(of: Void.self) { group in
@@ -1772,13 +1837,14 @@ enum PassFailure {
     case failed(any Error)
 
     init(_ error: any Error) {
-        if let healthKitError = error as? HKError,
+        let unwrapped: any Error = (error as? WorkoutRouteReadError)?.underlyingError ?? error
+        if let healthKitError = unwrapped as? HKError,
            healthKitError.code == .errorAuthorizationNotDetermined {
             self = .authorizationNotDetermined
-        } else if let healthKitError = error as? HKError,
+        } else if let healthKitError = unwrapped as? HKError,
                   healthKitError.code == .errorDatabaseInaccessible {
             self = .databaseLocked
-        } else if error is CancellationError {
+        } else if unwrapped is CancellationError {
             self = .cancelled
         } else {
             self = .failed(error)
