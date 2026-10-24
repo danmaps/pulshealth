@@ -4,7 +4,7 @@
 # Postgres over the internal docker network as the read-only `grafana` role —
 # or, in accounts mode, as the per-user `web_app` role.
 
-FROM node:26-alpine AS deps
+FROM node:26.12.1-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -16,14 +16,14 @@ COPY . .
 ENV NODE_ENV=production
 CMD ["npm", "exec", "--no", "--", "vitest", "run", "lib/readPerformance.test.ts", "--reporter=json", "--outputFile=/evidence/tests.json"]
 
-FROM node:26-alpine AS builder
+FROM node:26.12.1-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
-FROM node:26-alpine AS runner
+FROM node:26.12.1-alpine AS runner
 WORKDIR /app
 ARG BUILD_COMMIT=unknown
 LABEL org.opencontainers.image.revision=$BUILD_COMMIT \
